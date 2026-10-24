@@ -53,7 +53,7 @@ const server = http.createServer((req, res) => {
     return res.end('\ufeff' + body);
   }
   // static page
-  fs.readFile(path.join(__dirname, 'public', 'index.html'), (err, data) => {
+   fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
     if (err) { res.writeHead(500); return res.end('Missing public/index.html'); }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(data);
