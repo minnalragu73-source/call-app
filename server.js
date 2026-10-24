@@ -1,29 +1,70 @@
-// Group call + transcript server. No database: transcripts live in memory
-// while the server runs. Download them before the call room empties for long.
+// Group call + cloud transcription server (Groq Whisper).
+// Transcripts live in memory while the server runs: download after each call.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
-const PASSCODE = process.env.PASSCODE || '';          // optional team passcode
+const PASSCODE = process.env.PASSCODE || '';
 const MAX = parseInt(process.env.MAX_MEMBERS || '15', 10);
+const GROQ_KEY = process.env.GROQ_API_KEY || '';
+const MODEL = process.env.STT_MODEL || 'whisper-large-v3';
 const ICE = process.env.ICE_SERVERS
   ? JSON.parse(process.env.ICE_SERVERS)
   : [{ urls: 'stun:stun.l.google.com:19302' }];
+const PROMPT = 'Tamil and English mixed office conversation. தமிழ் மற்றும் English கலந்த உரையாடல்.';
+const JUNK = /^(thank you\.?|thanks for watching\.?|thanks\.?|you\.?|bye\.?|\.+)$/i;
 
-const rooms = new Map(); // name -> { members: Map(id -> {ws,name}), lines: [] }
+const rooms = new Map();
 const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 const clock = () => new Date().toLocaleTimeString('en-GB', { timeZone: 'Asia/Kolkata' });
 const today = () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 const cleanRoom = r => String(r || 'team').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 40) || 'team';
 const uid = () => Math.random().toString(36).slice(2, 10);
-
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 function getRoom(n) {
   if (!rooms.has(n)) rooms.set(n, { members: new Map(), lines: [] });
   return rooms.get(n);
 }
 const send = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+// ---- transcription queue (max 2 at once, retries on rate limit) ----
+const queue = []; let active = 0;
+async function callGroq(buf, lang) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const fd = new FormData();
+    fd.append('file', new Blob([buf], { type: 'audio/webm' }), 'clip.webm');
+    fd.append('model', MODEL);
+    fd.append('response_format', 'json');
+    fd.append('temperature', '0');
+    fd.append('prompt', PROMPT);
+    if (lang && lang !== 'auto') fd.append('language', lang);
+    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + GROQ_KEY }, body: fd
+    });
+    if (r.status === 429) { await sleep(Math.min(8000, 1500 * (attempt + 1) * 2)); continue; }
+    if (!r.ok) throw new Error('Groq ' + r.status + ' ' + (await r.text()).slice(0, 200));
+    return ((await r.json()).text || '').trim();
+  }
+  throw new Error('Rate limit: too many clips at once');
+}
+function pump() {
+  while (active < 2 && queue.length) {
+    const job = queue.shift(); active++;
+    callGroq(job.buf, job.lang).then(text => {
+      if (!text || JUNK.test(text)) return;
+      const room = rooms.get(job.roomName); if (!room) return;
+      const line = { name: job.name, text: text.slice(0, 1000), time: job.time, date: job.date, id: job.id };
+      room.lines.push(line);
+      room.members.forEach(p => send(p.ws, { type: 'line', ...line }));
+    }).catch(e => {
+      console.error(e.message);
+      const room = rooms.get(job.roomName), m = room && room.members.get(job.id);
+      if (m) send(m.ws, { type: 'note', msg: 'Transcription problem: ' + e.message });
+    }).finally(() => { active--; pump(); });
+  }
+}
 
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -52,29 +93,35 @@ const server = http.createServer((req, res) => {
     });
     return res.end('\ufeff' + body);
   }
-  // static page
-   fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
-    if (err) { res.writeHead(500); return res.end('Missing public/index.html'); }
+  fs.readFile(path.join(__dirname, 'index.html'), (err, data) => {
+    if (err) { res.writeHead(500); return res.end('Missing index.html'); }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(data);
   });
 });
 
-const wss = new WebSocketServer({ server, maxPayload: 16 * 1024 });
+const wss = new WebSocketServer({ server, maxPayload: 4 * 1024 * 1024 });
 
 wss.on('connection', ws => {
   let me = null, roomName = null;
   ws.isAlive = true;
   ws.on('pong', () => (ws.isAlive = true));
 
-  ws.on('message', raw => {
+  ws.on('message', (raw, isBinary) => {
+    if (isBinary) {                       // an audio clip from this member
+      if (!me) return;
+      if (!GROQ_KEY) return send(ws, { type: 'note', msg: 'Server has no GROQ_API_KEY set - voice typing is off' });
+      if (raw.length < 1500 || queue.length > 40) return;
+      queue.push({ buf: raw, lang: me.lang, name: me.name, id: me.id, roomName, time: clock(), date: today() });
+      return pump();
+    }
     let m; try { m = JSON.parse(raw); } catch { return; }
     if (m.type === 'join' && !me) {
       if (PASSCODE && m.pass !== PASSCODE) return send(ws, { type: 'error', msg: 'Wrong passcode' });
       roomName = cleanRoom(m.room);
       const room = getRoom(roomName);
       if (room.members.size >= MAX) return send(ws, { type: 'error', msg: `Room is full (${MAX} people)` });
-      me = { id: uid(), name: String(m.name || 'Guest').slice(0, 30), ws };
+      me = { id: uid(), name: String(m.name || 'Guest').slice(0, 30), lang: ['ta', 'en', 'auto'].includes(m.lang) ? m.lang : 'ta', ws };
       const peers = [...room.members.values()].map(p => ({ id: p.id, name: p.name }));
       room.members.set(me.id, me);
       send(ws, { type: 'welcome', id: me.id, peers, lines: room.lines.slice(-200) });
@@ -82,13 +129,6 @@ wss.on('connection', ws => {
     } else if (me && m.type === 'sig') {
       const t = getRoom(roomName).members.get(m.to);
       if (t) send(t.ws, { type: 'sig', from: me.id, kind: m.kind, payload: m.payload });
-    } else if (me && m.type === 'line') {
-      const text = String(m.text || '').trim().slice(0, 600);
-      if (!text) return;
-      const room = getRoom(roomName);
-      const line = { name: me.name, text, time: clock(), date: today(), id: me.id };
-      room.lines.push(line);
-      room.members.forEach(p => send(p.ws, { type: 'line', ...line }));
     }
   });
 
