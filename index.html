@@ -29,7 +29,7 @@ input,select{width:100%;box-sizing:border-box;margin-bottom:8px}
  <div class="s">Use headphones, so your microphone does not pick up other people's voices.</div>
 </div>
 <div id="call" hidden>
- <div class="c"><div id="who"></div><div id="st"></div>
+ <div class="c"><div id="who"></div><div id="st"></div><div id="vs" class="s"></div><button id="vt" style="width:100%;background:#1b8a3a;color:#fff;border:0;margin-bottom:8px">Tap here to start voice typing</button>
   <div class="r"><button id="mute">Mute mic</button><button id="leave">Leave</button></div></div>
  <div class="c" id="log"></div>
  <div class="r"><button id="xls">Save Excel</button><button id="doc">Save Word</button></div>
@@ -70,17 +70,26 @@ function mkPc(peer,initiator){
 function drop(p){if(pcs[p]){try{pcs[p].close()}catch(_){}delete pcs[p];}
  const a=document.getElementById('a'+p);if(a)a.remove();delete names[p];renderWho();}
 
+let recOn=false;
 function startRec(){
  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
- if(!SR){$('st').textContent='Voice typing needs Google Chrome. Call audio still works.';return;}
- rec=new SR();rec.lang=$('lang').value;rec.continuous=true;rec.interimResults=false;
- rec.onresult=e=>{for(let i=e.resultIndex;i<e.results.length;i++){
-  if(!e.results[i].isFinal||muted)continue;
-  const text=e.results[i][0].transcript.trim();
-  if(text&&ws.readyState===1)ws.send(JSON.stringify({type:'line',text}));}};
- rec.onend=()=>{if(running)try{rec.start()}catch(_){}};
- try{rec.start()}catch(_){}
+ if(!SR){$('vs').textContent='Voice typing needs Google Chrome.';return;}
+ try{rec&&rec.abort()}catch(_){}
+ rec=new SR();rec.lang=$('lang').value;rec.continuous=true;rec.interimResults=true;
+ rec.onstart=()=>{$('vs').textContent='Voice typing ON - speak now';$('vt').hidden=true;};
+ rec.onresult=e=>{let hear='';
+  for(let i=e.resultIndex;i<e.results.length;i++){
+   const r=e.results[i];
+   if(r.isFinal){if(muted)continue;const text=r[0].transcript.trim();
+    if(text&&ws.readyState===1)ws.send(JSON.stringify({type:'line',text}));}
+   else hear+=r[0].transcript;}
+  if(hear)$('vs').textContent='Hearing: '+hear;};
+ rec.onerror=e=>{$('vs').textContent='Voice typing problem: '+e.error;
+  if(['not-allowed','service-not-allowed','audio-capture','language-not-supported'].includes(e.error)){recOn=false;$('vt').hidden=false;}};
+ rec.onend=()=>{if(running&&recOn)setTimeout(()=>{try{rec.start()}catch(_){}},400);};
+ recOn=true;try{rec.start()}catch(_){}
 }
+$('vt').onclick=startRec;
 
 $('join').onclick=async()=>{
  myName=$('nm').value.trim();room=$('room').value.trim()||'team';pass=$('pass').value;
@@ -92,7 +101,7 @@ $('join').onclick=async()=>{
  ws.onmessage=async ev=>{const m=JSON.parse(ev.data);
   if(m.type==='error'){$('err').textContent=m.msg;stream.getTracks().forEach(t=>t.stop());ws.close();return;}
   if(m.type==='welcome'){me=m.id;m.peers.forEach(p=>names[p.id]=p.name);
-   $('lobby').hidden=true;$('call').hidden=false;m.lines.forEach(addLine);running=true;startRec();renderWho();}
+   $('lobby').hidden=true;$('call').hidden=false;m.lines.forEach(addLine);running=true;renderWho();$('vs').textContent='Tap the green button to start voice typing';}
   else if(m.type==='peer-join'){names[m.id]=m.name;renderWho();mkPc(m.id,true);}
   else if(m.type==='peer-left')drop(m.id);
   else if(m.type==='line'){addLine(m);speaking[m.id]=true;renderWho();setTimeout(()=>{speaking[m.id]=false;renderWho();},1500);}
@@ -105,7 +114,7 @@ $('join').onclick=async()=>{
 };
 $('mute').onclick=()=>{muted=!muted;stream.getAudioTracks().forEach(t=>t.enabled=!muted);
  $('mute').textContent=muted?'Unmute mic':'Mute mic';$('mute').classList.toggle('on',muted);};
-$('leave').onclick=()=>{running=false;try{rec&&rec.stop()}catch(_){}Object.keys(pcs).forEach(drop);
+$('leave').onclick=()=>{running=false;recOn=false;try{rec&&rec.stop()}catch(_){}Object.keys(pcs).forEach(drop);
  stream.getTracks().forEach(t=>t.stop());ws.close();$('st').textContent='You left. You can still save the transcript.';
  $('leave').disabled=true;$('mute').disabled=true;};
 const dlurl=f=>`/export?room=${encodeURIComponent(room)}&fmt=${f}&key=${encodeURIComponent(pass)}`;
