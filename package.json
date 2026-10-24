@@ -1,0 +1,9 @@
+{
+  "name": "call-transcriber",
+  "version": "1.0.0",
+  "description": "Group voice call (up to 15) with automatic per-person Tamil/English transcription and Excel/Word export",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "ws": "^8.18.0" }
+}
